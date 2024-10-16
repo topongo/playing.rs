@@ -1,4 +1,4 @@
-use std::{fmt::{Debug, Display}, process::exit, time::Duration, process::Command};
+use std::{fmt::{Debug, Display}, process::exit, time::Duration};
 use mpris::{DBusError, PlaybackStatus, PlayerFinder};
 use clap::{Parser,Subcommand,ValueEnum};
 
@@ -6,6 +6,7 @@ use clap::{Parser,Subcommand,ValueEnum};
 enum PlayingErrorKind {
     DBus,
     IO,
+    Spotifav,
 }
 
 impl Display for PlayingErrorKind {
@@ -32,6 +33,18 @@ impl From<std::io::Error> for PlayingError {
     }
 }
 
+impl From<Box<dyn std::error::Error>> for PlayingError {
+    fn from(value: Box<dyn std::error::Error>) -> Self {
+        PlayingError { kind: PlayingErrorKind::IO, code: 4, inner: value }
+    }
+}
+
+impl PlayingError {
+    fn from_spotifav(e: Box<dyn std::error::Error>) -> Self {
+        PlayingError { kind: PlayingErrorKind::Spotifav, code: 5, inner: e }
+    }
+}
+
 fn main() {
     let cmd = Cmd::parse();
 
@@ -54,8 +67,20 @@ enum Operation {
     Pause,
     Next,
     Previous,
-    Rewind,
-    Forward,
+    Rewind {
+        #[arg(default_value = "1")]
+        seconds: f32,
+    },
+    Forward {
+        #[arg(default_value = "1")]
+        seconds: f32,
+    },
+    SeekRelative {
+        seconds: f32,
+    },
+    Seek {
+        seconds: f32,
+    }
 }
 
 #[derive(Subcommand,Debug)]
@@ -64,6 +89,7 @@ enum Action {
     Operation(Operation),
     Status,
     Favorite,
+    Url,
 }
 
 #[derive(Parser,Debug)]
@@ -126,12 +152,10 @@ impl Player {
     }
 }
 
-const PYTHON_EXEC: &'static str = "/home/topongo/documents/python/spotify_utils/venv/bin/python";
-const SPOTIFY_FAVOURITE: &'static str = "/home/topongo/documents/python/spotify_utils/toggle_current_song_favourites.py";
-const SPOTIFY_FAVOURITE_PATH: &'static str = "/home/topongo/documents/python/spotify_utils/";
 const MAX_STATUS_LEN: usize = 70;
 
-fn run(cmd: Cmd) -> Result<(), PlayingError> {
+#[tokio::main]
+async fn run(cmd: Cmd) -> Result<(), PlayingError> {
     //eprintln!("{:?}", cmd);
     let finder = match PlayerFinder::new() {
         Ok(f) => f,
@@ -162,13 +186,21 @@ fn run(cmd: Cmd) -> Result<(), PlayingError> {
                         Operation::Pause => p.pause()?,
                         Operation::Next => p.next()?,
                         Operation::Previous => p.previous()?,
-                        Operation::Rewind => {
+                        Operation::Rewind { seconds } => {
                             //let pos = p.get_position().unwrap();
-                            p.seek_backwards(&Duration::from_secs(1))?
+                            p.seek_backwards(&Duration::from_secs_f32(*seconds))?
                         }
-                        Operation::Forward => {
+                        Operation::Forward { seconds } => {
                             //let pos = p.get_position().unwrap();
-                            p.seek_forwards(&Duration::from_secs(1))?
+                            p.seek_forwards(&Duration::from_secs_f32(*seconds))?
+                        }
+                        Operation::SeekRelative { seconds } => {
+                            p.seek((seconds * (1 << 6) as f32) as i64)?
+                        },
+                        Operation::Seek { seconds } => {
+                            if let Some(id) = p.get_metadata()?.track_id() {
+                                p.set_position(id, &Duration::from_secs_f32(*seconds))?
+                            }
                         }
                     }
                     Action::Status => {
@@ -177,7 +209,7 @@ fn run(cmd: Cmd) -> Result<(), PlayingError> {
                             let title = meta.title().unwrap_or("Unknown");
                             let album = meta.album_name().unwrap_or("Unknown");
                             let mut artists = meta.album_artists().unwrap_or(vec![]);
-                            if artists.len() == 0 {
+                            if artists.is_empty() {
                                 artists.push("Unknown")
                             }
 
@@ -189,7 +221,7 @@ fn run(cmd: Cmd) -> Result<(), PlayingError> {
 
                             let line = format!("{}  {} // {} @ {}", icon, title, album, artists[0]);
                             if line.len() > MAX_STATUS_LEN {
-                                println!("{}...", line[..MAX_STATUS_LEN-3].to_string());
+                                println!("{}...", &line[..MAX_STATUS_LEN-3].to_string());
                             } else {
                                 println!("{}", line);
                             }
@@ -199,12 +231,15 @@ fn run(cmd: Cmd) -> Result<(), PlayingError> {
                     Action::Favorite => {
                         if let Some(pl) = Player::parse(p.identity()) {
                             if pl == Player::Spotify {
-                                Command::new(PYTHON_EXEC)
-                                    .arg(SPOTIFY_FAVOURITE)
-                                    .current_dir(SPOTIFY_FAVOURITE_PATH)
-                                    .spawn()?
-                                    .wait()?;
+                                let cli = spotifav::get_client().await.map_err(PlayingError::from_spotifav)?;
+                                spotifav::do_toggle(&cli).await.map_err(PlayingError::from_spotifav)?;
                             }
+                        }
+                    }
+                    Action::Url => {
+                        if let Some(_) = Player::parse(p.identity()) {
+                            let meta = p.get_metadata()?;
+                            print!("{}", meta.url().unwrap_or(""));
                         }
                     }
                 }
