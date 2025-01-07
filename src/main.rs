@@ -1,6 +1,6 @@
 use std::{fmt::{Debug, Display}, process::exit, time::Duration};
 use mpris::{DBusError, PlaybackStatus, PlayerFinder};
-use clap::{Parser,Subcommand,ValueEnum};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug)]
 enum PlayingErrorKind {
@@ -45,12 +45,16 @@ impl PlayingError {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cmd = Cmd::parse();
 
-    if let Err(e) = run(cmd) {
-        eprintln!("error: {}: {}", e.kind, e.inner);
-        exit(e.code);
+    match run(cmd).await {
+        Ok(e) => exit(if e { 0 } else { 1 }),
+        Err(e) => {
+            eprintln!("error: {}: {}", e.kind, e.inner);
+            exit(e.code);
+        }
     }
 }
 
@@ -87,8 +91,20 @@ enum Operation {
 enum Action {
     #[command(subcommand)]
     Operation(Operation),
-    Status,
-    Favorite,
+    Status { 
+        #[arg(action = ArgAction::SetTrue, long)]
+        no_icon: bool,
+        #[arg(action = ArgAction::SetTrue, long)]
+        no_icon_space: bool,
+        #[arg(action = ArgAction::SetTrue, short)]
+        quiet: bool 
+    },
+    Favorite {
+        #[arg(default_value = "false", short, long)]
+        poll: bool,
+        #[arg(long)]
+        always: bool,
+    },
     Url,
 }
 
@@ -154,8 +170,7 @@ impl Player {
 
 const MAX_STATUS_LEN: usize = 70;
 
-#[tokio::main]
-async fn run(cmd: Cmd) -> Result<(), PlayingError> {
+async fn run(cmd: Cmd) -> Result<bool, PlayingError> {
     //eprintln!("{:?}", cmd);
     let finder = match PlayerFinder::new() {
         Ok(f) => f,
@@ -165,6 +180,19 @@ async fn run(cmd: Cmd) -> Result<(), PlayingError> {
             inner: e.into(),
         }),
     };
+
+    if let Action::Favorite { always, poll } = cmd.action {
+        // if let Some(pl) = Player::parse(p.identity()) {
+            // if pl == Player::Spotify {
+                let cli = spotifav::get_client().await.map_err(PlayingError::from_spotifav)?;
+                spotifav::do_toggle(&cli).await.map_err(PlayingError::from_spotifav)?;
+            // }
+        // }
+        if always && poll {
+            spotifav::poll(&spotifav::get_client().await?).await?;
+            return Ok(false)
+        }
+    }
 
     let ranking = vec![Custom("mpv"), Vlc, Firefox, Spotify, Chrome];
 
@@ -203,8 +231,11 @@ async fn run(cmd: Cmd) -> Result<(), PlayingError> {
                             }
                         }
                     }
-                    Action::Status => {
+                    Action::Status { no_icon, no_icon_space, quiet } => {
                         if p.get_playback_status()? == PlaybackStatus::Playing {
+                            if quiet {
+                                return Ok(false)
+                            }
                             let meta = p.get_metadata()?;
                             let title = meta.title().unwrap_or("Unknown");
                             let album = meta.album_name().unwrap_or("Unknown");
@@ -213,29 +244,27 @@ async fn run(cmd: Cmd) -> Result<(), PlayingError> {
                                 artists.push("Unknown")
                             }
 
-                            let icon = if let Some(pl) = Player::parse(p.identity()) {
-                                pl.icon()
-                            } else {
-                                ""
+                            let icon = match Player::parse(p.identity()) {
+                                Some(pl) => pl.icon(),
+                                None => ""
                             };
 
-                            let line = format!("{}  {} // {} @ {}", icon, title, album, artists[0]);
+                            let icon = format!("{}", if no_icon {
+                                "".to_owned()
+                            } else {
+                                format!("{}{}", icon, if no_icon_space { "" } else { " " })
+                            });
+
+                            let line = format!("{}{} // {} @ {}", icon, title, album, artists[0]);
                             if line.len() > MAX_STATUS_LEN {
                                 println!("{}...", &line[..MAX_STATUS_LEN-3].to_string());
                             } else {
                                 println!("{}", line);
                             }
-                            return Ok(())
+                            return Ok(true)
                         }
                     }
-                    Action::Favorite => {
-                        if let Some(pl) = Player::parse(p.identity()) {
-                            if pl == Player::Spotify {
-                                let cli = spotifav::get_client().await.map_err(PlayingError::from_spotifav)?;
-                                spotifav::do_toggle(&cli).await.map_err(PlayingError::from_spotifav)?;
-                            }
-                        }
-                    }
+                    Action::Favorite { .. } => {}
                     Action::Url => {
                         if let Some(_) = Player::parse(p.identity()) {
                             let meta = p.get_metadata()?;
@@ -247,9 +276,12 @@ async fn run(cmd: Cmd) -> Result<(), PlayingError> {
         }
     }
 
-    if let Action::Status = cmd.action {
-        println!("No media");
+    if let Action::Status { quiet, .. } = cmd.action {
+        match quiet {
+            true => return Ok(false),
+            false => println!("No media")
+        }
     }
 
-    Ok(())
+    Ok(true)
 }

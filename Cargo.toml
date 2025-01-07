@@ -6,5 +6,7 @@ edition = "2021"
 [dependencies]
 clap = { version = "^4.5.7", features = ["derive"] }
 mpris = "2.0.1"
-spotifav = "0.2.0"
+# spotifav = "0.2.0"
+spotifav = { path = "../spotifav" }
 tokio = "1.40.0"
+
