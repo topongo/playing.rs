@@ -89,13 +89,14 @@ enum Operation {
 
 #[derive(Subcommand,Debug)]
 enum Action {
-    #[command(subcommand)]
+    #[command(subcommand, alias = "op")]
     Operation(Operation),
+    Player,
     Status { 
         #[arg(action = ArgAction::SetTrue, long)]
         no_icon: bool,
-        #[arg(action = ArgAction::SetTrue, long)]
-        no_icon_space: bool,
+        #[arg(default_value = "1", long)]
+        spaces_after_icon: usize,
         #[arg(action = ArgAction::SetTrue, short)]
         quiet: bool 
     },
@@ -182,14 +183,15 @@ async fn run(cmd: Cmd) -> Result<bool, PlayingError> {
     };
 
     if let Action::Favorite { always, poll } = cmd.action {
-        // if let Some(pl) = Player::parse(p.identity()) {
-            // if pl == Player::Spotify {
-                let cli = spotifav::get_client().await.map_err(PlayingError::from_spotifav)?;
-                spotifav::do_toggle(&cli).await.map_err(PlayingError::from_spotifav)?;
-            // }
-        // }
-        if always && poll {
-            spotifav::poll(&spotifav::get_client().await?).await?;
+        if finder.find_by_name("Spotify").is_ok() || always {
+            let cli = spotifav::get_client().await.map_err(PlayingError::from_spotifav)?;
+            if poll {
+                spotifav::poll(&cli).await.map_err(PlayingError::from_spotifav)?;
+            }
+            spotifav::do_toggle(&cli).await.map_err(PlayingError::from_spotifav)?;
+            return Ok(true)
+        } else {
+            eprintln!("spotify is not playing");
             return Ok(false)
         }
     }
@@ -231,7 +233,7 @@ async fn run(cmd: Cmd) -> Result<bool, PlayingError> {
                             }
                         }
                     }
-                    Action::Status { no_icon, no_icon_space, quiet } => {
+                    Action::Status { no_icon, spaces_after_icon, quiet } => {
                         if p.get_playback_status()? == PlaybackStatus::Playing {
                             if quiet {
                                 return Ok(false)
@@ -252,7 +254,7 @@ async fn run(cmd: Cmd) -> Result<bool, PlayingError> {
                             let icon = format!("{}", if no_icon {
                                 "".to_owned()
                             } else {
-                                format!("{}{}", icon, if no_icon_space { "" } else { " " })
+                                format!("{}{}", icon, " ".repeat(spaces_after_icon))
                             });
 
                             let line = format!("{}{} // {} @ {}", icon, title, album, artists[0]);
@@ -270,6 +272,9 @@ async fn run(cmd: Cmd) -> Result<bool, PlayingError> {
                             let meta = p.get_metadata()?;
                             print!("{}", meta.url().unwrap_or(""));
                         }
+                    }
+                    Action::Player => {
+                        println!("{}", p.identity());
                     }
                 }
             }
