@@ -189,7 +189,11 @@ async fn run(cmd: Cmd) -> Result<bool, PlayingError> {
             if poll {
                 spotifav::poll(&cli).await.map_err(PlayingError::from_spotifav)?;
             }
-            spotifav::do_toggle(&cli).await.map_err(PlayingError::from_spotifav)?;
+            if spotifav::do_toggle(&cli).await.map_err(PlayingError::from_spotifav)? {
+                println!("added song to favorites");
+            } else {
+                println!("removed song from favorites");
+            }
             return Ok(true)
         } else {
             eprintln!("spotify is not playing");
