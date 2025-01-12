@@ -139,7 +139,7 @@ impl Player {
         match self {
             Mpv => "mpv",
             Vlc => "vlc",
-            Firefox => "firefox",
+            Firefox => "Mozilla firefox",
             Spotify => "Spotify",
             Chrome => "chrome",
             Custom(s) => s,
@@ -150,9 +150,10 @@ impl Player {
         match s {
             "mpv" => Some(Mpv),
             "vlc" => Some(Vlc),
-            "firefox" => Some(Firefox),
+            "Mozilla firefox" => Some(Firefox),
             "Spotify" => Some(Spotify),
             "chrome" => Some(Chrome),
+            // c => { println!("{}", c); None },
             _ => None,
         }
     }
@@ -160,7 +161,7 @@ impl Player {
     fn icon(&self) -> &'static str {
         match self {
             Mpv => "",
-            Vlc => "嗢",
+            Vlc => "󰕼",
             Firefox => "",
             Spotify => "",
             Chrome => "",
@@ -234,6 +235,7 @@ async fn run(cmd: Cmd) -> Result<bool, PlayingError> {
                         }
                     }
                     Action::Status { no_icon, spaces_after_icon, quiet } => {
+                        // println!("status: {:?}", p.get_playback_status()?);
                         if p.get_playback_status()? == PlaybackStatus::Playing {
                             if quiet {
                                 return Ok(false)
