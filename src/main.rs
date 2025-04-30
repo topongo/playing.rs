@@ -1,4 +1,4 @@
-use std::{fmt::{Debug, Display}, process::exit, time::Duration};
+use std::{collections::HashMap, fmt::{Debug, Display}, process::exit, time::Duration};
 use mpris::{DBusError, PlaybackStatus, PlayerFinder};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
@@ -60,8 +60,9 @@ async fn main() {
 
 #[derive(Clone,PartialEq,Eq,PartialOrd,Ord,ValueEnum,Debug)]
 enum Mode {
-    Single,
-    Multiple,
+    Broadcast,
+    Best,
+    PauseAllThenBest,
 }
 
 #[derive(Subcommand, Debug)]
@@ -117,21 +118,23 @@ enum Action {
     author = "topongo"
 )]
 struct Cmd {
-    #[arg(value_enum,short,long,default_value = "single")]
+    #[arg(value_enum,short,long,default_value = "pause-all-then-best")]
     mode: Mode,
     #[command(subcommand)]
     action: Action,
 }
 
-#[derive(PartialEq,Eq,PartialOrd,Ord,Debug)]
+#[derive(PartialEq,Eq,PartialOrd,Ord,Debug,Hash,Clone,Copy)]
 enum Player {
     Mpv,
     Vlc,
     Firefox,
     Spotify,
     Chrome,
+    YouTube,
     Custom(&'static str)
 }
+use url::Url;
 use Player::*;
 
 impl Player {
@@ -142,17 +145,38 @@ impl Player {
             Firefox => "Mozilla firefox",
             Spotify => "Spotify",
             Chrome => "chrome",
+            YouTube => "youtube",
             Custom(s) => s,
         }
     }
 
-    fn parse(s: &str) -> Option<Player> {
+    fn parse_from_dbus(p: &mpris::Player) -> Option<Self> {
+        let id = p.identity();
+        let metadata = p.get_metadata();
+        let url = metadata.as_ref().map(|m| m.url()).ok().flatten();
+        Self::parse(id, url)
+    }
+
+    fn parse(s: &str, u: Option<&str>) -> Option<Self> {
+        fn browser(b: Player, u: Option<&str>) -> Player {
+            if let Some(Ok(u)) = u.map(Url::parse) {
+                if let Some(host) = u.host_str() {
+                    return match host {
+                        "youtube.com" | "www.youtube.com" => YouTube,
+                        "open.spotify.com" => Spotify,
+                        _ => b,
+                    }
+                }
+            }
+            b
+        }
+
         match s {
             "mpv" => Some(Mpv),
             "vlc" => Some(Vlc),
-            "Mozilla firefox" => Some(Firefox),
+            "Mozilla firefox" => Some(browser(Firefox, u)),
             "Spotify" => Some(Spotify),
-            "chrome" => Some(Chrome),
+            "chrome" => Some(browser(Chrome, u)),
             // c => { println!("{}", c); None },
             _ => None,
         }
@@ -165,6 +189,7 @@ impl Player {
             Firefox => "",
             Spotify => "",
             Chrome => "",
+            YouTube => "",
             Custom(_) => "",
         }
     }
@@ -183,108 +208,174 @@ async fn run(cmd: Cmd) -> Result<bool, PlayingError> {
         }),
     };
 
-    if let Action::Favorite { always, poll } = cmd.action {
-        if finder.find_by_name("Spotify").is_ok() || always {
-            let cli = spotifav::get_client().await.map_err(PlayingError::from_spotifav)?;
-            if poll {
-                spotifav::poll(&cli).await.map_err(PlayingError::from_spotifav)?;
-            }
-            if spotifav::do_toggle(&cli).await.map_err(PlayingError::from_spotifav)? {
-                println!("added song to favorites");
+    let ranking = vec![Spotify, YouTube, Custom("mpv"), Firefox, Chrome];
+
+    let players = finder
+        .find_all()
+        // TODO: fix this unwrap
+        .unwrap()
+        .into_iter()
+        .filter_map(|p| Player::parse_from_dbus(&p).map(|v| (v, p)))
+        .fold(HashMap::<Player, Vec<mpris::Player>>::new(), |mut acc, (id, p)| {
+            acc.entry(id).or_default().push(p);
+            acc
+        });
+
+    println!("dbus players: {:#?}", players);
+
+    let mut toggle_pause_all = false;
+    let targets: Option<Vec<(Player, &mpris::Player)>> = match cmd.mode {
+        Mode::Broadcast => None,
+        Mode::Best => Some(ranking
+            .iter()
+            .filter_map(|id| players.get(id).map(|v| (*id, v)))
+            .flat_map(|(id, v)| v.iter().map(move |p| (id, p)))
+            .next()
+            .map(|v| vec![v])
+            .unwrap_or_default()),
+        Mode::PauseAllThenBest => match &cmd.action {
+            Action::Operation(Operation::Pause) => None,
+            Action::Operation(Operation::Play) => Some(ranking
+                .iter()
+                .filter_map(|id| players.get(id).map(|v| (*id, v)))
+                .flat_map(|(id, v)| v.iter().map(move |p| (id, p)))
+                .collect::<Vec<_>>()),
+            Action::Operation(Operation::Toggle) => if players
+                .iter()
+                .flat_map(|(_, v)| v.iter())
+                .any(|p| p.get_playback_status().unwrap() == PlaybackStatus::Playing) {
+                toggle_pause_all = true;
+                None
             } else {
-                println!("removed song from favorites");
+                Some(ranking
+                    .iter()
+                    .filter_map(|id| players.get(id).map(|v| (*id, v)))
+                    .flat_map(|(id, v)| v.iter().map(move |p| (id, p)))
+                    .next()
+                    .map(|v| vec![v])
+                    .unwrap_or_default())
             }
-            return Ok(true)
-        } else {
-            eprintln!("spotify is not playing");
-            return Ok(false)
+            _ => None,
         }
-    }
+    };
 
-    let ranking = vec![Custom("mpv"), Vlc, Firefox, Spotify, Chrome];
+    let targets = targets.unwrap_or(players
+        .iter()
+        .flat_map(|(id, v)| v.iter().map(|v| (*id, v)))
+        .collect::<Vec<_>>()
+    );
 
-    for id in ranking {
-        // println!("Checking for {}", id.to_str());
-        for p in finder.find_all().unwrap() {
+    println!("{:#?}", targets);
+
+    for (id, p) in targets {
             // println!("\tFound {}", p.identity());
-            if p.identity() == id.to_str() {
-                match cmd.action {
-                    Action::Operation(ref op) => match op {
-                        Operation::Toggle => {
-                            if let PlaybackStatus::Playing = p.get_playback_status().unwrap() {
-                                p.pause()?
-                            } else {
-                                p.play()?
-                            }
-                        },
-                        Operation::Play => p.play()?,
-                        Operation::Pause => p.pause()?,
-                        Operation::Next => p.next()?,
-                        Operation::Previous => p.previous()?,
-                        Operation::Rewind { seconds } => {
-                            //let pos = p.get_position().unwrap();
-                            p.seek_backwards(&Duration::from_secs_f32(*seconds))?
-                        }
-                        Operation::Forward { seconds } => {
-                            //let pos = p.get_position().unwrap();
-                            p.seek_forwards(&Duration::from_secs_f32(*seconds))?
-                        }
-                        Operation::SeekRelative { seconds } => {
-                            p.seek((seconds * (1 << 6) as f32) as i64)?
-                        },
-                        Operation::Seek { seconds } => {
-                            if let Some(id) = p.get_metadata()?.track_id() {
-                                p.set_position(id, &Duration::from_secs_f32(*seconds))?
-                            }
-                        }
+            let player = Player::parse(p.identity(), p.get_metadata().as_ref().map(|m| m.url()).ok().flatten());
+            if let Action::Favorite { poll, always } = cmd.action {
+                if always || matches!(player, Some(Spotify)) {
+                    let cli = spotifav::get_client().await.map_err(PlayingError::from_spotifav)?;
+                    if poll {
+                        spotifav::poll(&cli).await.map_err(PlayingError::from_spotifav)?;
                     }
-                    Action::Status { no_icon, spaces_after_icon, quiet } => {
-                        // println!("status: {:?}", p.get_playback_status()?);
-                        if p.get_playback_status()? == PlaybackStatus::Playing {
-                            if quiet {
-                                return Ok(false)
-                            }
-                            let meta = p.get_metadata()?;
-                            let title = meta.title().unwrap_or("Unknown");
-                            let album = meta.album_name().unwrap_or("Unknown");
-                            let mut artists = meta.album_artists().unwrap_or(vec![]);
-                            if artists.is_empty() {
-                                artists.push("Unknown")
-                            }
-
-                            let icon = match Player::parse(p.identity()) {
-                                Some(pl) => pl.icon(),
-                                None => ""
-                            };
-
-                            let icon = format!("{}", if no_icon {
-                                "".to_owned()
-                            } else {
-                                format!("{}{}", icon, " ".repeat(spaces_after_icon))
-                            });
-
-                            let line = format!("{}{} // {} @ {}", icon, title, album, artists[0]);
-                            if line.len() > MAX_STATUS_LEN {
-                                println!("{}...", &line[..MAX_STATUS_LEN-3].to_string());
-                            } else {
-                                println!("{}", line);
-                            }
-                            return Ok(true)
-                        }
+                    if spotifav::do_toggle(&cli).await.map_err(PlayingError::from_spotifav)? {
+                        println!("added song to favorites");
+                    } else {
+                        println!("removed song from favorites");
                     }
-                    Action::Favorite { .. } => {}
-                    Action::Url => {
-                        if let Some(_) = Player::parse(p.identity()) {
-                            let meta = p.get_metadata()?;
-                            print!("{}", meta.url().unwrap_or(""));
-                        }
-                    }
-                    Action::Player => {
-                        println!("{}", p.identity());
-                    }
+                    return Ok(true)
+                } else {
+                    eprintln!("spotify is not playing");
+                    return Ok(false)
                 }
             }
-        }
+            eprintln!("executing action {:?} on player {}", cmd.action, id.to_str());
+            match cmd.action {
+                Action::Operation(ref op) => match op {
+                    Operation::Toggle => {
+                        if toggle_pause_all || matches!(p.get_playback_status().unwrap(), PlaybackStatus::Playing) {
+                            p.pause()?
+                        } else {
+                            p.play()?
+                        }
+                    },
+                    Operation::Play => p.play()?,
+                    Operation::Pause => p.pause()?,
+                    Operation::Next => p.next()?,
+                    Operation::Previous => p.previous()?,
+                    Operation::Rewind { seconds } => {
+                        //let pos = p.get_position().unwrap();
+                        p.seek_backwards(&Duration::from_secs_f32(*seconds))?
+                    }
+                    Operation::Forward { seconds } => {
+                        //let pos = p.get_position().unwrap();
+                        p.seek_forwards(&Duration::from_secs_f32(*seconds))?
+                    }
+                    Operation::SeekRelative { seconds } => {
+                        p.seek((seconds * (1 << 6) as f32) as i64)?
+                    },
+                    Operation::Seek { seconds } => {
+                        if let Some(id) = p.get_metadata()?.track_id() {
+                            p.set_position(id, &Duration::from_secs_f32(*seconds))?
+                        }
+                    }
+                }
+                Action::Status { no_icon, spaces_after_icon, quiet } => {
+                    // println!("status: {:?}", p.get_playback_status()?);
+                    if p.get_playback_status()? == PlaybackStatus::Playing {
+                        if quiet {
+                            return Ok(false)
+                        }
+                        let meta = p.get_metadata()?;
+                        let title = meta.title().unwrap_or("Unknown");
+                        let album = meta.album_name().filter(|a| !a.is_empty());
+                        let mut artists = vec![];
+                        if let Some(a) = meta.album_artists() {
+                            artists.extend(a);
+                        }
+                        if let Some(a) = meta.artists() {
+                            artists.extend(a);
+                        }
+
+                        let icon = match &player {
+                            Some(pl) => pl.icon(),
+                            None => ""
+                        };
+
+                        let icon = if no_icon {
+                            "".to_owned()
+                        } else {
+                            format!("{}{}", icon, " ".repeat(spaces_after_icon))
+                        };
+
+                        let line = format!(
+                            "{}{}{}{}", 
+                            icon, 
+                            title,
+                            match album { Some(a) => format!(" // {}", a), None => "".to_string() },
+                            match artists.len() {
+                                0 => "".to_string(),
+                                _ => format!(" @ {}", artists[0]),
+                            },
+                        );
+
+                        if line.len() > MAX_STATUS_LEN {
+                            println!("{}...", &line[..MAX_STATUS_LEN-3].to_string());
+                        } else {
+                            println!("{}", line);
+                        }
+                        return Ok(true)
+                    }
+                }
+                Action::Favorite { .. } => {}
+                Action::Url => {
+                    if Player::parse(p.identity(), None).is_some() {
+                        let meta = p.get_metadata()?;
+                        print!("{}", meta.url().unwrap_or(""));
+                    }
+                }
+                Action::Player => {
+                    println!("{}", p.identity());
+                }
+            }
     }
 
     if let Action::Status { quiet, .. } = cmd.action {

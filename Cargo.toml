@@ -9,4 +9,5 @@ mpris = "2.0.1"
 # spotifav = "0.2.0"
 spotifav = { path = "../spotifav" }
 tokio = "1.40.0"
+url = "2.5.4"
 
