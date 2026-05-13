@@ -92,13 +92,13 @@ enum Action {
     #[command(subcommand, alias = "op")]
     Operation(Operation),
     Player,
-    Status { 
+    Status {
         #[arg(action = ArgAction::SetTrue, long)]
         no_icon: bool,
         #[arg(default_value = "1", long)]
         spaces_after_icon: usize,
         #[arg(action = ArgAction::SetTrue, short)]
-        quiet: bool 
+        quiet: bool,
     },
     Favorite {
         #[arg(default_value = "false", short, long)]
@@ -257,11 +257,11 @@ async fn run(cmd: Cmd) -> Result<bool, PlayingError> {
                                 None => ""
                             };
 
-                            let icon = format!("{}", if no_icon {
+                            let icon = if no_icon {
                                 "".to_owned()
                             } else {
                                 format!("{}{}", icon, " ".repeat(spaces_after_icon))
-                            });
+                            };
 
                             let line = format!("{}{} // {} @ {}", icon, title, album, artists[0]);
                             if line.len() > MAX_STATUS_LEN {
@@ -274,7 +274,7 @@ async fn run(cmd: Cmd) -> Result<bool, PlayingError> {
                     }
                     Action::Favorite { .. } => {}
                     Action::Url => {
-                        if let Some(_) = Player::parse(p.identity()) {
+                        if Player::parse(p.identity()).is_some() {
                             let meta = p.get_metadata()?;
                             print!("{}", meta.url().unwrap_or(""));
                         }
